@@ -63,6 +63,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("model", task_props)
         self.assertIn("provider", task_props)
         self.assertIn("terminal_backend", task_props)
+        self.assertIn("max_iterations", task_props)
 
 
 class TestChildSystemPrompt(unittest.TestCase):

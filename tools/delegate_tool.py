@@ -190,6 +190,8 @@ def _run_single_child(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    # Per-task iteration budget (None = share parent's budget)
+    override_iteration_budget=None,
 ) -> Dict[str, Any]:
     """
     Spawn and run a single child agent. Called from within a thread.
@@ -224,9 +226,10 @@ def _run_single_child(
         # Build progress callback to relay tool calls to parent display
         child_progress_cb = _build_child_progress_callback(task_index, parent_agent, task_count)
 
-        # Share the parent's iteration budget so subagent tool calls
-        # count toward the session-wide limit.
-        shared_budget = getattr(parent_agent, "iteration_budget", None)
+        # Iteration budget: use per-task budget if provided, else share
+        # the parent's budget so subagent tool calls count toward the
+        # session-wide limit.
+        shared_budget = override_iteration_budget or getattr(parent_agent, "iteration_budget", None)
 
         # Resolve effective credentials: config override > parent inherit
         effective_model = model or parent_agent.model
@@ -419,6 +422,19 @@ def delegate_task(
                            task_model, task_provider)
             return default_creds
 
+    def _resolve_task_budget(task: dict) -> tuple:
+        """Return (max_iterations, iteration_budget_or_None) for a task.
+
+        When the task specifies its own max_iterations, the child gets an
+        independent IterationBudget so it doesn't starve siblings or the
+        parent.  Otherwise, the child shares the parent's budget.
+        """
+        task_max = task.get("max_iterations")
+        if task_max and isinstance(task_max, int) and task_max > 0:
+            from run_agent import IterationBudget
+            return task_max, IterationBudget(task_max)
+        return effective_max_iter, None  # None = share parent's budget
+
     def _setup_task_backend(task: dict, task_index: int):
         """Register per-task backend override if specified."""
         backend = task.get("terminal_backend")
@@ -436,6 +452,7 @@ def delegate_task(
         # Single task -- run directly (no thread pool overhead)
         t = task_list[0]
         task_creds = _resolve_task_creds(t)
+        task_max_iter, task_budget = _resolve_task_budget(t)
         _setup_task_backend(t, 0)
         result = _run_single_child(
             task_index=0,
@@ -443,13 +460,14 @@ def delegate_task(
             context=t.get("context"),
             toolsets=t.get("toolsets") or toolsets,
             model=task_creds["model"],
-            max_iterations=effective_max_iter,
+            max_iterations=task_max_iter,
             parent_agent=parent_agent,
             task_count=1,
             override_provider=task_creds["provider"],
             override_base_url=task_creds["base_url"],
             override_api_key=task_creds["api_key"],
             override_api_mode=task_creds["api_mode"],
+            override_iteration_budget=task_budget,
         )
         results.append(result)
     else:
@@ -466,6 +484,7 @@ def delegate_task(
             futures = {}
             for i, t in enumerate(task_list):
                 task_creds = _resolve_task_creds(t)
+                task_max_iter, task_budget = _resolve_task_budget(t)
                 _setup_task_backend(t, i)
                 future = executor.submit(
                     _run_single_child,
@@ -474,13 +493,14 @@ def delegate_task(
                     context=t.get("context"),
                     toolsets=t.get("toolsets") or toolsets,
                     model=task_creds["model"],
-                    max_iterations=effective_max_iter,
+                    max_iterations=task_max_iter,
                     parent_agent=parent_agent,
                     task_count=n_tasks,
                     override_provider=task_creds["provider"],
                     override_base_url=task_creds["base_url"],
                     override_api_key=task_creds["api_key"],
                     override_api_mode=task_creds["api_mode"],
+                    override_iteration_budget=task_budget,
                 )
                 futures[future] = i
 
@@ -714,6 +734,16 @@ DELEGATE_TASK_SCHEMA = {
                                 "others local."
                             ),
                         },
+                        "max_iterations": {
+                            "type": "integer",
+                            "description": (
+                                "Max tool-calling turns for this specific task. "
+                                "When set, the child gets its own iteration budget "
+                                "independent of the parent and siblings, preventing "
+                                "starvation. Falls back to the top-level "
+                                "max_iterations if unset."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -722,7 +752,7 @@ DELEGATE_TASK_SCHEMA = {
                     "configurable via delegation.max_concurrent_children, "
                     "default 3). Each gets its own subagent with isolated "
                     "context and terminal session. Per-task model, provider, "
-                    "and terminal_backend overrides are supported. "
+                    "terminal_backend, and max_iterations overrides are supported. "
                     "When provided, top-level goal/context/toolsets are ignored."
                 ),
             },
