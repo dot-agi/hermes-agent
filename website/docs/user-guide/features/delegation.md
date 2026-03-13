@@ -146,7 +146,7 @@ If omitted, subagents use the same model as the parent.
 
 ### Per-Task Overrides (Batch Mode)
 
-In batch mode, each task can specify its own `model`, `provider`, and `terminal_backend`:
+In batch mode, each task can specify its own `model`, `provider`, `terminal_backend`, and `max_iterations`:
 
 ```python
 delegate_task(tasks=[
@@ -154,18 +154,22 @@ delegate_task(tasks=[
         "goal": "Survey recent papers on topic X",
         "toolsets": ["web"],
         "model": "google/gemini-flash-2.0",       # Fast model for research
-        "provider": "openrouter"
+        "provider": "openrouter",
+        "max_iterations": 30                       # Independent budget
     },
     {
         "goal": "Implement the algorithm from the paper",
         "toolsets": ["terminal", "file"],
         "model": "anthropic/claude-sonnet-4",      # Strong coding model
-        "terminal_backend": "modal"                # Run on remote GPU
+        "terminal_backend": "modal",               # Run on remote GPU
+        "max_iterations": 80                       # More budget for complex work
     }
 ])
 ```
 
 Available `terminal_backend` values: `local`, `docker`, `modal`, `ssh`, `singularity`, `daytona`.
+
+When `max_iterations` is set on a task, the child gets its own independent iteration budget instead of sharing the parent's. This prevents starvation where one slow child exhausts the shared budget before siblings finish. If omitted, the child shares the parent's budget (original behavior).
 
 ### Configurable Limits
 
