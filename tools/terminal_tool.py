@@ -855,7 +855,11 @@ def terminal_tool(
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
         overrides = _task_env_overrides.get(effective_task_id, {})
-        
+
+        # Per-task backend override (e.g., from delegate_task per-task routing)
+        if overrides.get("terminal_backend"):
+            env_type = overrides["terminal_backend"]
+
         # Select image based on env type, with per-task override support
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
