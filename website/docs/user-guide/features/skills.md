@@ -10,6 +10,11 @@ Skills are on-demand knowledge documents the agent can load when needed. They fo
 
 All skills live in **`~/.hermes/skills/`** — a single directory that serves as the source of truth. On fresh install, bundled skills are copied from the repo. Hub-installed and agent-created skills also go here. The agent can modify or delete any skill.
 
+See also:
+
+- [Bundled Skills Catalog](/docs/reference/skills-catalog)
+- [Official Optional Skills Catalog](/docs/reference/optional-skills-catalog)
+
 ## Using Skills
 
 Every installed skill is automatically available as a slash command:
@@ -116,6 +121,20 @@ metadata:
 
 Skills without any conditional fields behave exactly as before — they're always shown.
 
+## Secure Setup on Load
+
+Skills can declare required environment variables without disappearing from discovery:
+
+```yaml
+required_environment_variables:
+  - name: TENOR_API_KEY
+    prompt: Tenor API key
+    help: Get a key from https://developers.google.com/tenor
+    required_for: full functionality
+```
+
+When a missing value is encountered, Hermes asks for it securely only when the skill is actually loaded in the local CLI. You can skip setup and keep using the skill. Messaging surfaces never ask for secrets in chat — they tell you to use `hermes setup` or `~/.hermes/.env` locally instead.
+
 ## Skill Directory Structure
 
 ```
@@ -125,6 +144,7 @@ Skills without any conditional fields behave exactly as before — they're alway
 │   │   ├── SKILL.md               # Main instructions (required)
 │   │   ├── references/            # Additional docs
 │   │   ├── templates/             # Output formats
+│   │   ├── scripts/               # Helper scripts callable from the skill
 │   │   └── assets/                # Supplementary files
 │   └── vllm/
 │       └── SKILL.md
@@ -184,6 +204,8 @@ hermes skills tap add myorg/skills-repo  # Add a custom source
 ```
 
 All hub-installed skills go through a **security scanner** that checks for data exfiltration, prompt injection, destructive commands, and other threats.
+
+Official optional skills use identifiers like `official/security/1password` and `official/migration/openclaw-migration`.
 
 ### Trust Levels
 

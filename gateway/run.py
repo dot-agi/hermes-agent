@@ -248,14 +248,21 @@ class GatewayRunner:
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         
         # Track pending exec approvals per session
-        # Key: session_key, Value: {"command": str, "pattern_key": str}
-        self._pending_approvals: Dict[str, Dict[str, str]] = {}
+        # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
+        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
         self._honcho_managers: Dict[str, Any] = {}
         self._honcho_configs: Dict[str, Any] = {}
+
+        # Ensure tirith security scanner is available (downloads if needed)
+        try:
+            from tools.tirith_security import ensure_installed
+            ensure_installed()
+        except Exception:
+            pass  # Non-fatal — fail-open at scan time if unavailable
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -461,23 +468,25 @@ class GatewayRunner:
 
     @staticmethod
     def _load_reasoning_config() -> dict | None:
-        """Load reasoning effort from config or env var.
-        
-        Checks HERMES_REASONING_EFFORT env var first, then agent.reasoning_effort
-        in config.yaml. Valid: "xhigh", "high", "medium", "low", "minimal", "none".
-        Returns None to use default (medium).
+        """Load reasoning effort from config with env fallback.
+
+        Checks agent.reasoning_effort in config.yaml first, then
+        HERMES_REASONING_EFFORT as a fallback. Valid: "xhigh", "high",
+        "medium", "low", "minimal", "none". Returns None to use default
+        (medium).
         """
-        effort = os.getenv("HERMES_REASONING_EFFORT", "")
+        effort = ""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                effort = str(cfg.get("agent", {}).get("reasoning_effort", "") or "").strip()
+        except Exception:
+            pass
         if not effort:
-            try:
-                import yaml as _y
-                cfg_path = _hermes_home / "config.yaml"
-                if cfg_path.exists():
-                    with open(cfg_path, encoding="utf-8") as _f:
-                        cfg = _y.safe_load(_f) or {}
-                    effort = str(cfg.get("agent", {}).get("reasoning_effort", "") or "").strip()
-            except Exception:
-                pass
+            effort = os.getenv("HERMES_REASONING_EFFORT", "")
         if not effort:
             return None
         effort = effort.lower().strip()
@@ -926,7 +935,7 @@ class GatewayRunner:
         command = event.get_command()
         
         # Emit command:* hook for any recognized slash command
-        _known_commands = {"new", "reset", "help", "status", "stop", "model",
+        _known_commands = {"new", "reset", "help", "status", "stop", "model", "reasoning",
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
                           "update", "title", "resume", "provider", "rollback",
@@ -953,7 +962,10 @@ class GatewayRunner:
         
         if command == "model":
             return await self._handle_model_command(event)
-        
+
+        if command == "reasoning":
+            return await self._handle_reasoning_command(event)
+
         if command == "provider":
             return await self._handle_provider_command(event)
         
@@ -1033,7 +1045,9 @@ class GatewayRunner:
                 cmd_key = f"/{command}"
                 if cmd_key in skill_cmds:
                     user_instruction = event.get_command_args().strip()
-                    msg = build_skill_invocation_message(cmd_key, user_instruction)
+                    msg = build_skill_invocation_message(
+                        cmd_key, user_instruction, task_id=session_key
+                    )
                     if msg:
                         event.text = msg
                         # Fall through to normal message processing with skill content
@@ -1047,11 +1061,15 @@ class GatewayRunner:
             if user_text in ("yes", "y", "approve", "ok", "go", "do it"):
                 approval = self._pending_approvals.pop(session_key_preview)
                 cmd = approval["command"]
-                pattern_key = approval.get("pattern_key", "")
+                pattern_keys = approval.get("pattern_keys", [])
+                if not pattern_keys:
+                    pk = approval.get("pattern_key", "")
+                    pattern_keys = [pk] if pk else []
                 logger.info("User approved dangerous command: %s...", cmd[:60])
                 from tools.terminal_tool import terminal_tool
                 from tools.approval import approve_session
-                approve_session(session_key_preview, pattern_key)
+                for pk in pattern_keys:
+                    approve_session(session_key_preview, pk)
                 result = terminal_tool(command=cmd, force=True)
                 return f"✅ Command approved and executed.\n\n```\n{result[:3500]}\n```"
             elif user_text in ("no", "n", "deny", "cancel", "nope"):
@@ -1123,10 +1141,16 @@ class GatewayRunner:
                 get_model_context_length,
             )
 
-            # Read model + compression config from config.yaml — same
-            # source of truth the agent itself uses.
+            # Read model + compression config from config.yaml.
+            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
+            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
+            # sessions that grew too large between turns — it fires pre-agent
+            # to prevent API failures.  The agent's own compressor handles
+            # normal context management during its tool loop with accurate
+            # real token counts.  Having hygiene at 0.50 caused premature
+            # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.50
+            _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
             try:
                 _hyg_cfg_path = _hermes_home / "config.yaml"
@@ -1142,22 +1166,18 @@ class GatewayRunner:
                     elif isinstance(_model_cfg, dict):
                         _hyg_model = _model_cfg.get("default", _hyg_model)
 
-                    # Read compression settings
+                    # Read compression settings — only use enabled flag.
+                    # The threshold is intentionally separate from the agent's
+                    # compression.threshold (hygiene runs higher).
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
-                        _hyg_threshold_pct = float(
-                            _comp_cfg.get("threshold", _hyg_threshold_pct)
-                        )
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in ("true", "1", "yes")
             except Exception:
                 pass
 
-            # Also check env overrides (same as run_agent.py)
-            _hyg_threshold_pct = float(
-                os.getenv("CONTEXT_COMPRESSION_THRESHOLD", str(_hyg_threshold_pct))
-            )
+            # Check env override for disabling compression entirely
             if os.getenv("CONTEXT_COMPRESSION_ENABLED", "").lower() in ("false", "0", "no"):
                 _hyg_compression_enabled = False
 
@@ -1443,6 +1463,11 @@ class GatewayRunner:
             
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
+
+            # If the agent's session_id changed during compression, update
+            # session_entry so transcript writes below go to the right session.
+            if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+                session_entry.session_id = agent_result["session_id"]
 
             # Prepend reasoning/thinking if display is enabled
             if getattr(self, "_show_reasoning", False) and response:
@@ -2183,6 +2208,8 @@ class GatewayRunner:
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = reasoning_config
 
             def run_sync():
                 agent = AIAgent(
@@ -2192,7 +2219,7 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
-                    reasoning_config=self._reasoning_config,
+                    reasoning_config=reasoning_config,
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -2290,6 +2317,8 @@ class GatewayRunner:
 
         args = event.get_command_args().strip().lower()
         config_path = _hermes_home / "config.yaml"
+        self._reasoning_config = self._load_reasoning_config()
+        self._show_reasoning = self._load_show_reasoning()
 
         def _save_config_key(key_path: str, value):
             """Save a dot-separated key to config.yaml."""
@@ -3348,6 +3377,8 @@ class GatewayRunner:
 
             pr = self._provider_routing
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
+            reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = reasoning_config
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -3357,7 +3388,7 @@ class GatewayRunner:
                 enabled_toolsets=enabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._prefill_messages or None,
-                reasoning_config=self._reasoning_config,
+                reasoning_config=reasoning_config,
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
                 providers_order=pr.get("order"),
@@ -3493,6 +3524,23 @@ class GatewayRunner:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
+            # Sync session_id: the agent may have created a new session during
+            # mid-run context compression (_compress_context splits sessions).
+            # If so, update the session store entry so the NEXT message loads
+            # the compressed transcript, not the stale pre-compression one.
+            agent = agent_holder[0]
+            if agent and session_key and hasattr(agent, 'session_id') and agent.session_id != session_id:
+                logger.info(
+                    "Session split detected: %s → %s (compression)",
+                    session_id, agent.session_id,
+                )
+                entry = self.session_store._entries.get(session_key)
+                if entry:
+                    entry.session_id = agent.session_id
+                    self.session_store._save()
+
+            effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
+
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
@@ -3501,6 +3549,7 @@ class GatewayRunner:
                 "tools": tools_holder[0] or [],
                 "history_offset": len(agent_history),
                 "last_prompt_tokens": _last_prompt_toks,
+                "session_id": effective_session_id,
             }
         
         # Start progress message sender if enabled

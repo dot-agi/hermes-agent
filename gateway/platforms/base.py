@@ -25,6 +25,13 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
+from hermes_cli.config import get_hermes_home
+
+
+GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
+    "Secure secret entry is not supported over messaging. "
+    "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,8 +43,8 @@ from gateway.session import SessionSource, build_session_key
 # (e.g. Telegram file URLs expire after ~1 hour).
 # ---------------------------------------------------------------------------
 
-# Default location: ~/.hermes/image_cache/
-IMAGE_CACHE_DIR = Path(os.path.expanduser("~/.hermes/image_cache"))
+# Default location: {HERMES_HOME}/image_cache/
+IMAGE_CACHE_DIR = get_hermes_home() / "image_cache"
 
 
 def get_image_cache_dir() -> Path:
@@ -119,7 +126,7 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
 # here so the STT tool (OpenAI Whisper) can transcribe them from local files.
 # ---------------------------------------------------------------------------
 
-AUDIO_CACHE_DIR = Path(os.path.expanduser("~/.hermes/audio_cache"))
+AUDIO_CACHE_DIR = get_hermes_home() / "audio_cache"
 
 
 def get_audio_cache_dir() -> Path:
@@ -178,7 +185,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg") -> str:
 # here so the agent can reference them by local file path.
 # ---------------------------------------------------------------------------
 
-DOCUMENT_CACHE_DIR = Path(os.path.expanduser("~/.hermes/document_cache"))
+DOCUMENT_CACHE_DIR = get_hermes_home() / "document_cache"
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",

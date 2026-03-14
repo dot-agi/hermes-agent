@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.config import get_env_path, get_env_value
+from hermes_cli.config import get_env_path, get_env_value, get_hermes_home
 from hermes_constants import OPENROUTER_MODELS_URL
 
 def check_mark(ok: bool) -> str:
@@ -77,7 +77,6 @@ def show_status(args):
     
     keys = {
         "OpenRouter": "OPENROUTER_API_KEY",
-        "Anthropic": "ANTHROPIC_API_KEY", 
         "OpenAI": "OPENAI_API_KEY",
         "Z.AI/GLM": "GLM_API_KEY",
         "Kimi": "KIMI_API_KEY",
@@ -97,6 +96,14 @@ def show_status(args):
         has_key = bool(value)
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
+
+    anthropic_value = (
+        get_env_value("ANTHROPIC_TOKEN")
+        or get_env_value("ANTHROPIC_API_KEY")
+        or ""
+    )
+    anthropic_display = redact_key(anthropic_value) if not show_all else anthropic_value
+    print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
 
     # =========================================================================
     # Auth Providers (OAuth)
@@ -260,7 +267,7 @@ def show_status(args):
     print()
     print(color("◆ Scheduled Jobs", Colors.CYAN, Colors.BOLD))
     
-    jobs_file = Path.home() / ".hermes" / "cron" / "jobs.json"
+    jobs_file = get_hermes_home() / "cron" / "jobs.json"
     if jobs_file.exists():
         import json
         try:
@@ -280,7 +287,7 @@ def show_status(args):
     print()
     print(color("◆ Sessions", Colors.CYAN, Colors.BOLD))
     
-    sessions_file = Path.home() / ".hermes" / "sessions" / "sessions.json"
+    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
     if sessions_file.exists():
         import json
         try:

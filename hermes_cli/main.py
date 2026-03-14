@@ -34,11 +34,12 @@ Usage:
     hermes honcho identity                 # Show AI peer identity representation
     hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
     hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
-    hermes version             # Show version
-    hermes update              # Update to latest version
-    hermes uninstall           # Uninstall Hermes Agent
-    hermes sessions browse     # Interactive session picker with search
-    hermes claw migrate        # Migrate from OpenClaw to Hermes
+    hermes version             Show version
+    hermes update              Update to latest version
+    hermes uninstall           Uninstall Hermes Agent
+    hermes acp                 Run as an ACP server for editor integration
+    hermes sessions browse     Interactive session picker with search
+
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
@@ -86,7 +87,7 @@ def _has_any_provider_configured() -> bool:
     from hermes_cli.auth import PROVIDER_REGISTRY
 
     # Collect all provider env vars
-    provider_env_vars = {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL"}
+    provider_env_vars = {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "OPENAI_BASE_URL"}
     for pconfig in PROVIDER_REGISTRY.values():
         if pconfig.auth_type == "api_key":
             provider_env_vars.update(pconfig.api_key_env_vars)
@@ -477,6 +478,15 @@ def cmd_chat(args):
         print()
         print("  Run:  hermes setup")
         print()
+
+        from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance
+
+        if not is_interactive_stdin():
+            print_noninteractive_setup_guidance(
+                "No interactive TTY detected for the first-run setup prompt."
+            )
+            sys.exit(1)
+
         try:
             reply = input("Run setup now? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -648,7 +658,7 @@ def cmd_whatsapp(args):
         print("✓ Bridge dependencies already installed")
 
     # ── Step 5: Check for existing session ───────────────────────────────
-    session_dir = Path.home() / ".hermes" / "whatsapp" / "session"
+    session_dir = get_hermes_home() / "whatsapp" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if (session_dir / "creds.json").exists():
@@ -745,8 +755,8 @@ def cmd_model(args):
         config_provider = model_cfg.get("provider")
 
     effective_provider = (
-        os.getenv("HERMES_INFERENCE_PROVIDER")
-        or config_provider
+        config_provider
+        or os.getenv("HERMES_INFERENCE_PROVIDER")
         or "auto"
     )
     try:
@@ -1057,6 +1067,7 @@ def _model_flow_openai_codex(config, current_model=""):
         _codex_token = _codex_creds.get("api_key")
     except Exception:
         pass
+
     codex_models = get_codex_model_ids(access_token=_codex_token)
 
     selected = _prompt_model_selection(codex_models, current_model=current_model)
@@ -1070,6 +1081,7 @@ def _model_flow_openai_codex(config, current_model=""):
         print(f"Default model set to: {selected} (via OpenAI Codex)")
     else:
         print("No change.")
+
 
 
 def _model_flow_custom(config):
@@ -1593,6 +1605,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
 def _run_anthropic_oauth_flow(save_env_value):
     """Run the Claude OAuth setup-token flow. Returns True if credentials were saved."""
     from agent.anthropic_adapter import run_oauth_setup_token
+    from hermes_cli.config import save_anthropic_oauth_token
 
     try:
         print()
@@ -1601,7 +1614,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         token = run_oauth_setup_token()
         if token:
-            save_env_value("ANTHROPIC_API_KEY", token)
+            save_anthropic_oauth_token(token, save_fn=save_env_value)
             print("  ✓ OAuth credentials saved.")
             return True
 
@@ -1615,7 +1628,7 @@ def _run_anthropic_oauth_flow(save_env_value):
             print()
             return False
         if manual_token:
-            save_env_value("ANTHROPIC_API_KEY", manual_token)
+            save_anthropic_oauth_token(manual_token, save_fn=save_env_value)
             print("  ✓ Setup-token saved.")
             return True
 
@@ -1642,7 +1655,7 @@ def _run_anthropic_oauth_flow(save_env_value):
             print()
             return False
         if token:
-            save_env_value("ANTHROPIC_API_KEY", token)
+            save_anthropic_oauth_token(token, save_fn=save_env_value)
             print("  ✓ Setup-token saved.")
             return True
         print("  Cancelled — install Claude Code and try again.")
@@ -1656,17 +1669,20 @@ def _model_flow_anthropic(config, current_model=""):
         PROVIDER_REGISTRY, _prompt_model_selection, _save_model_choice,
         _update_config_for_provider, deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+    from hermes_cli.config import (
+        get_env_value, save_env_value, load_config, save_config,
+        save_anthropic_api_key,
+    )
     from hermes_cli.models import _PROVIDER_MODELS
 
     pconfig = PROVIDER_REGISTRY["anthropic"]
 
     # Check ALL credential sources
     existing_key = (
-        get_env_value("ANTHROPIC_API_KEY")
-        or os.getenv("ANTHROPIC_API_KEY", "")
-        or get_env_value("ANTHROPIC_TOKEN")
+        get_env_value("ANTHROPIC_TOKEN")
         or os.getenv("ANTHROPIC_TOKEN", "")
+        or get_env_value("ANTHROPIC_API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY", "")
         or os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
     )
     cc_available = False
@@ -1734,7 +1750,7 @@ def _model_flow_anthropic(config, current_model=""):
             if not api_key:
                 print("  Cancelled.")
                 return
-            save_env_value("ANTHROPIC_API_KEY", api_key)
+            save_anthropic_api_key(api_key, save_fn=save_env_value)
             print("  ✓ API key saved.")
 
         else:
@@ -3096,6 +3112,27 @@ For more help on a command:
         help="Skip confirmation prompts"
     )
     uninstall_parser.set_defaults(func=cmd_uninstall)
+
+    # =========================================================================
+    # acp command
+    # =========================================================================
+    acp_parser = subparsers.add_parser(
+        "acp",
+        help="Run Hermes Agent as an ACP (Agent Client Protocol) server",
+        description="Start Hermes Agent in ACP mode for editor integration (VS Code, Zed, JetBrains)",
+    )
+
+    def cmd_acp(args):
+        """Launch Hermes Agent as an ACP server."""
+        try:
+            from acp_adapter.entry import main as acp_main
+            acp_main()
+        except ImportError:
+            print("ACP dependencies not installed.")
+            print("Install them with:  pip install -e '.[acp]'")
+            sys.exit(1)
+
+    acp_parser.set_defaults(func=cmd_acp)
     
     # =========================================================================
     # Parse and execute

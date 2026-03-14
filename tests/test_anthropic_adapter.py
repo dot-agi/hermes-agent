@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
@@ -133,9 +134,16 @@ class TestIsClaudeCodeTokenValid:
 
 
 class TestResolveAnthropicToken:
-    def test_prefers_api_key(self, monkeypatch):
+    def test_prefers_oauth_token_over_api_key(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
+        assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
+
+    def test_falls_back_to_api_key_when_no_oauth_sources_exist(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() == "sk-ant-api03-mykey"
 
     def test_falls_back_to_token(self, monkeypatch):
@@ -351,6 +359,17 @@ class TestNormalizeModelName:
     def test_leaves_bare_name(self):
         assert normalize_model_name("claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
 
+    def test_converts_dots_to_hyphens(self):
+        """OpenRouter uses dots (4.6), Anthropic uses hyphens (4-6)."""
+        assert normalize_model_name("anthropic/claude-opus-4.6") == "claude-opus-4-6"
+        assert normalize_model_name("anthropic/claude-sonnet-4.5") == "claude-sonnet-4-5"
+        assert normalize_model_name("claude-opus-4.6") == "claude-opus-4-6"
+
+    def test_already_hyphenated_unchanged(self):
+        """Names already in Anthropic format should pass through."""
+        assert normalize_model_name("claude-opus-4-6") == "claude-opus-4-6"
+        assert normalize_model_name("claude-opus-4-5-20251101") == "claude-opus-4-5-20251101"
+
 
 # ---------------------------------------------------------------------------
 # Tool conversion
@@ -472,6 +491,55 @@ class TestConvertMessages:
         # When cache_control is present, system should be a list of blocks
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_assistant_cache_control_blocks_are_preserved(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "assistant", "content": "Hello from assistant"},
+        ])
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_blocks = result[0]["content"]
+
+        assert assistant_blocks[0]["type"] == "text"
+        assert assistant_blocks[0]["text"] == "Hello from assistant"
+        assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_tool_cache_control_is_preserved_on_tool_result_block(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ])
+
+        _, result = convert_messages_to_anthropic(messages)
+        tool_block = result[0]["content"][0]
+
+        assert tool_block["type"] == "tool_result"
+        assert tool_block["tool_use_id"] == "tc_1"
+        assert tool_block["content"] == "result"
+        assert tool_block["cache_control"] == {"type": "ephemeral"}
+
+    def test_empty_cached_assistant_tool_turn_converts_without_empty_text_block(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Find the skill"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "skill_view", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ])
+
+        _, result = convert_messages_to_anthropic(messages)
+
+        assistant_turn = next(msg for msg in result if msg["role"] == "assistant")
+        assistant_blocks = assistant_turn["content"]
+
+        assert all(not (b.get("type") == "text" and b.get("text") == "") for b in assistant_blocks)
+        assert any(b.get("type") == "tool_use" for b in assistant_blocks)
 
 
 # ---------------------------------------------------------------------------

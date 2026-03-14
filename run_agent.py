@@ -21,6 +21,7 @@ Usage:
 """
 
 import atexit
+import concurrent.futures
 import copy
 import hashlib
 import json
@@ -109,18 +110,17 @@ HONCHO_TOOL_NAMES = {
 
 
 class _SafeWriter:
-    """Transparent stdout wrapper that catches OSError from broken pipes.
+    """Transparent stdio wrapper that catches OSError from broken pipes.
 
     When hermes-agent runs as a systemd service, Docker container, or headless
-    daemon, the stdout pipe can become unavailable (idle timeout, buffer
+    daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
     exhaustion, socket reset). Any print() call then raises
-    ``OSError: [Errno 5] Input/output error``, which can crash
-    run_conversation() — especially via double-fault when the except handler
+    ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
+    run_conversation() — especially via double-fault when an except handler
     also tries to print.
 
     This wrapper delegates all writes to the underlying stream and silently
-    catches OSError.  It is installed once at the start of run_conversation()
-    and is transparent when stdout is healthy (zero overhead on the happy path).
+    catches OSError. It is transparent when the wrapped stream is healthy.
     """
 
     __slots__ = ("_inner",)
@@ -151,6 +151,14 @@ class _SafeWriter:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def _install_safe_stdio() -> None:
+    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and not isinstance(stream, _SafeWriter):
+            setattr(sys, stream_name, _SafeWriter(stream))
 
 
 class IterationBudget:
@@ -191,6 +199,40 @@ class IterationBudget:
     def remaining(self) -> int:
         with self._lock:
             return max(0, self.max_total - self._used)
+
+
+# Tools that must never run concurrently (interactive / user-facing).
+# When any of these appear in a batch, we fall back to sequential execution.
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+
+# Maximum number of concurrent worker threads for parallel tool execution.
+_MAX_TOOL_WORKERS = 8
+
+
+def _inject_honcho_turn_context(content, turn_context: str):
+    """Append Honcho recall to the current-turn user message without mutating history.
+
+    The returned content is sent to the API for this turn only. Keeping Honcho
+    recall out of the system prompt preserves the stable cache prefix while
+    still giving the model continuity context.
+    """
+    if not turn_context:
+        return content
+
+    note = (
+        "[System note: The following Honcho memory was retrieved from prior "
+        "sessions. It is continuity context for this turn only, not new user "
+        "input.]\n\n"
+        f"{turn_context}"
+    )
+
+    if isinstance(content, list):
+        return list(content) + [{"type": "text", "text": note}]
+
+    text = "" if content is None else str(content)
+    if not text.strip():
+        return note
+    return f"{text}\n\n{note}"
 
 
 class AIAgent:
@@ -289,6 +331,8 @@ class AIAgent:
             honcho_manager: Optional shared HonchoSessionManager owned by the caller.
             honcho_config: Optional HonchoClientConfig corresponding to honcho_manager.
         """
+        _install_safe_stdio()
+
         self.model = model
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
@@ -372,19 +416,30 @@ class AIAgent:
 
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
-        from agent.redact import RedactingFormatter
-        _error_log_dir = Path.home() / ".hermes" / "logs"
-        _error_log_dir.mkdir(parents=True, exist_ok=True)
-        _error_log_path = _error_log_dir / "errors.log"
+        # In gateway mode, each incoming message creates a new AIAgent instance,
+        # while the root logger is process-global. Re-adding the same errors.log
+        # handler would cause each warning/error line to be written multiple times.
         from logging.handlers import RotatingFileHandler
-        _error_file_handler = RotatingFileHandler(
-            _error_log_path, maxBytes=2 * 1024 * 1024, backupCount=2,
+        root_logger = logging.getLogger()
+        error_log_dir = _hermes_home / "logs"
+        error_log_path = error_log_dir / "errors.log"
+        resolved_error_log_path = error_log_path.resolve()
+        has_errors_log_handler = any(
+            isinstance(handler, RotatingFileHandler)
+            and Path(getattr(handler, "baseFilename", "")).resolve() == resolved_error_log_path
+            for handler in root_logger.handlers
         )
-        _error_file_handler.setLevel(logging.WARNING)
-        _error_file_handler.setFormatter(RedactingFormatter(
-            '%(asctime)s %(levelname)s %(name)s: %(message)s',
-        ))
-        logging.getLogger().addHandler(_error_file_handler)
+        if not has_errors_log_handler:
+            from agent.redact import RedactingFormatter
+            error_log_dir.mkdir(parents=True, exist_ok=True)
+            error_file_handler = RotatingFileHandler(
+                error_log_path, maxBytes=2 * 1024 * 1024, backupCount=2,
+            )
+            error_file_handler.setLevel(logging.WARNING)
+            error_file_handler.setFormatter(RedactingFormatter(
+                '%(asctime)s %(levelname)s %(name)s: %(message)s',
+            ))
+            root_logger.addHandler(error_file_handler)
 
         if self.verbose_logging:
             logging.basicConfig(
@@ -445,11 +500,8 @@ class AIAgent:
         self._anthropic_client = None
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client
-            effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "") or os.getenv("ANTHROPIC_TOKEN", "")
-            if not effective_key:
-                from agent.anthropic_adapter import resolve_anthropic_token
-                effective_key = resolve_anthropic_token() or ""
+            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+            effective_key = api_key or resolve_anthropic_token() or ""
             self._anthropic_api_key = effective_key
             self._anthropic_client = build_anthropic_client(effective_key, base_url)
             # No OpenAI client needed for Anthropic mode
@@ -1138,9 +1190,15 @@ class AIAgent:
                         except (json.JSONDecodeError, AttributeError):
                             pass  # Keep as string if not valid JSON
                         
+                        tool_index = len(tool_responses)
+                        tool_name = (
+                            msg["tool_calls"][tool_index]["function"]["name"]
+                            if tool_index < len(msg["tool_calls"])
+                            else "unknown"
+                        )
                         tool_response += json.dumps({
                             "tool_call_id": tool_msg.get("tool_call_id", ""),
-                            "name": msg["tool_calls"][len(tool_responses)]["function"]["name"] if len(tool_responses) < len(msg["tool_calls"]) else "unknown",
+                            "name": tool_name,
                             "content": tool_content
                         }, ensure_ascii=False)
                         tool_response += "\n</tool_response>"
@@ -2699,6 +2757,42 @@ class AIAgent:
 
             return kwargs
 
+        sanitized_messages = api_messages
+        needs_sanitization = False
+        for msg in api_messages:
+            if not isinstance(msg, dict):
+                continue
+            if "codex_reasoning_items" in msg:
+                needs_sanitization = True
+                break
+
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    if "call_id" in tool_call or "response_item_id" in tool_call:
+                        needs_sanitization = True
+                        break
+                if needs_sanitization:
+                    break
+
+        if needs_sanitization:
+            sanitized_messages = copy.deepcopy(api_messages)
+            for msg in sanitized_messages:
+                if not isinstance(msg, dict):
+                    continue
+
+                # Codex-only replay state must not leak into strict chat-completions APIs.
+                msg.pop("codex_reasoning_items", None)
+
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, dict):
+                            tool_call.pop("call_id", None)
+                            tool_call.pop("response_item_id", None)
+
         provider_preferences = {}
         if self.providers_allowed:
             provider_preferences["only"] = self.providers_allowed
@@ -2715,9 +2809,9 @@ class AIAgent:
 
         api_kwargs = {
             "model": self.model,
-            "messages": api_messages,
+            "messages": sanitized_messages,
             "tools": self.tools if self.tools else None,
-            "timeout": 900.0,
+            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 900.0)),
         }
 
         if self.max_tokens is not None:
@@ -3119,7 +3213,260 @@ class AIAgent:
         return compressed, new_system_prompt
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute tool calls from the assistant message and append results to messages."""
+        """Execute tool calls from the assistant message and append results to messages.
+
+        Dispatches to concurrent execution when multiple independent tool calls
+        are present, falling back to sequential execution for single calls or
+        when interactive tools (e.g. clarify) are in the batch.
+        """
+        tool_calls = assistant_message.tool_calls
+
+        # Single tool call or interactive tool present → sequential
+        if (len(tool_calls) <= 1
+                or any(tc.function.name in _NEVER_PARALLEL_TOOLS for tc in tool_calls)):
+            return self._execute_tool_calls_sequential(
+                assistant_message, messages, effective_task_id, api_call_count
+            )
+
+        # Multiple non-interactive tools → concurrent
+        return self._execute_tool_calls_concurrent(
+            assistant_message, messages, effective_task_id, api_call_count
+        )
+
+    def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
+        """Invoke a single tool and return the result string. No display logic.
+
+        Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
+        tools. Used by the concurrent execution path; the sequential path retains
+        its own inline invocation for backward-compatible display handling.
+        """
+        if function_name == "todo":
+            from tools.todo_tool import todo_tool as _todo_tool
+            return _todo_tool(
+                todos=function_args.get("todos"),
+                merge=function_args.get("merge", False),
+                store=self._todo_store,
+            )
+        elif function_name == "session_search":
+            if not self._session_db:
+                return json.dumps({"success": False, "error": "Session database not available."})
+            from tools.session_search_tool import session_search as _session_search
+            return _session_search(
+                query=function_args.get("query", ""),
+                role_filter=function_args.get("role_filter"),
+                limit=function_args.get("limit", 3),
+                db=self._session_db,
+                current_session_id=self.session_id,
+            )
+        elif function_name == "memory":
+            target = function_args.get("target", "memory")
+            from tools.memory_tool import memory_tool as _memory_tool
+            result = _memory_tool(
+                action=function_args.get("action"),
+                target=target,
+                content=function_args.get("content"),
+                old_text=function_args.get("old_text"),
+                store=self._memory_store,
+            )
+            # Also send user observations to Honcho when active
+            if self._honcho and target == "user" and function_args.get("action") == "add":
+                self._honcho_save_user_observation(function_args.get("content", ""))
+            return result
+        elif function_name == "clarify":
+            from tools.clarify_tool import clarify_tool as _clarify_tool
+            return _clarify_tool(
+                question=function_args.get("question", ""),
+                choices=function_args.get("choices"),
+                callback=self.clarify_callback,
+            )
+        elif function_name == "delegate_task":
+            from tools.delegate_tool import delegate_task as _delegate_task
+            return _delegate_task(
+                goal=function_args.get("goal"),
+                context=function_args.get("context"),
+                toolsets=function_args.get("toolsets"),
+                tasks=function_args.get("tasks"),
+                max_iterations=function_args.get("max_iterations"),
+                parent_agent=self,
+            )
+        else:
+            return handle_function_call(
+                function_name, function_args, effective_task_id,
+                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+            )
+
+    def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+        """Execute multiple tool calls concurrently using a thread pool.
+
+        Results are collected in the original tool-call order and appended to
+        messages so the API sees them in the expected sequence.
+        """
+        tool_calls = assistant_message.tool_calls
+        num_tools = len(tool_calls)
+
+        # ── Pre-flight: interrupt check ──────────────────────────────────
+        if self._interrupt_requested:
+            print(f"{self.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
+            for tc in tool_calls:
+                messages.append({
+                    "role": "tool",
+                    "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
+                    "tool_call_id": tc.id,
+                })
+            return
+
+        # ── Parse args + pre-execution bookkeeping ───────────────────────
+        parsed_calls = []  # list of (tool_call, function_name, function_args)
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+
+            # Reset nudge counters
+            if function_name == "memory":
+                self._turns_since_memory = 0
+            elif function_name == "skill_manage":
+                self._iters_since_skill = 0
+
+            try:
+                function_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                function_args = {}
+            if not isinstance(function_args, dict):
+                function_args = {}
+
+            # Checkpoint for file-mutating tools
+            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+                try:
+                    file_path = function_args.get("path", "")
+                    if file_path:
+                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
+                        self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+                except Exception:
+                    pass
+
+            parsed_calls.append((tool_call, function_name, function_args))
+
+        # ── Logging / callbacks ──────────────────────────────────────────
+        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
+        if not self.quiet_mode:
+            print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+            for i, (tc, name, args) in enumerate(parsed_calls, 1):
+                args_str = json.dumps(args, ensure_ascii=False)
+                args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
+
+        for _, name, args in parsed_calls:
+            if self.tool_progress_callback:
+                try:
+                    preview = _build_tool_preview(name, args)
+                    self.tool_progress_callback(name, preview, args)
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error: {cb_err}")
+
+        # ── Concurrent execution ─────────────────────────────────────────
+        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
+        results = [None] * num_tools
+
+        def _run_tool(index, tool_call, function_name, function_args):
+            """Worker function executed in a thread."""
+            start = time.time()
+            try:
+                result = self._invoke_tool(function_name, function_args, effective_task_id)
+            except Exception as tool_error:
+                result = f"Error executing tool '{function_name}': {tool_error}"
+                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            duration = time.time() - start
+            is_error, _ = _detect_tool_failure(function_name, result)
+            results[index] = (function_name, function_args, result, duration, is_error)
+
+        # Start spinner for CLI mode
+        spinner = None
+        if self.quiet_mode:
+            face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+            spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots')
+            spinner.start()
+
+        try:
+            max_workers = min(num_tools, _MAX_TOOL_WORKERS)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for i, (tc, name, args) in enumerate(parsed_calls):
+                    f = executor.submit(_run_tool, i, tc, name, args)
+                    futures.append(f)
+
+                # Wait for all to complete (exceptions are captured inside _run_tool)
+                concurrent.futures.wait(futures)
+        finally:
+            if spinner:
+                # Build a summary message for the spinner stop
+                completed = sum(1 for r in results if r is not None)
+                total_dur = sum(r[3] for r in results if r is not None)
+                spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
+
+        # ── Post-execution: display per-tool results ─────────────────────
+        for i, (tc, name, args) in enumerate(parsed_calls):
+            r = results[i]
+            if r is None:
+                # Shouldn't happen, but safety fallback
+                function_result = f"Error executing tool '{name}': thread did not return a result"
+                tool_duration = 0.0
+            else:
+                function_name, function_args, function_result, tool_duration, is_error = r
+
+                if is_error:
+                    result_preview = function_result[:200] if len(function_result) > 200 else function_result
+                    logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+
+                if self.verbose_logging:
+                    result_preview = function_result[:200] if len(function_result) > 200 else function_result
+                    logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
+                    logging.debug(f"Tool result preview: {result_preview}...")
+
+            # Print cute message per tool
+            if self.quiet_mode:
+                cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
+                print(f"  {cute_msg}")
+            elif not self.quiet_mode:
+                response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
+
+            # Truncate oversized results
+            MAX_TOOL_RESULT_CHARS = 100_000
+            if len(function_result) > MAX_TOOL_RESULT_CHARS:
+                original_len = len(function_result)
+                function_result = (
+                    function_result[:MAX_TOOL_RESULT_CHARS]
+                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
+                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
+                )
+
+            # Append tool result message in order
+            tool_msg = {
+                "role": "tool",
+                "content": function_result,
+                "tool_call_id": tc.id,
+            }
+            messages.append(tool_msg)
+
+        # ── Budget pressure injection ────────────────────────────────────
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            try:
+                parsed = json.loads(last_content)
+                if isinstance(parsed, dict):
+                    parsed["_budget_warning"] = budget_warning
+                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            except (json.JSONDecodeError, TypeError):
+                messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+
+    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+        """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
             # If the user sent "stop" during a previous tool's execution,
@@ -3577,10 +3924,9 @@ class AIAgent:
         Returns:
             Dict: Complete conversation result with final response and message history
         """
-        # Guard stdout against OSError from broken pipes (systemd/headless/daemon).
-        # Installed once, transparent when stdout is healthy, prevents crash on write.
-        if not isinstance(sys.stdout, _SafeWriter):
-            sys.stdout = _SafeWriter(sys.stdout)
+        # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
+        # Installed once, transparent when streams are healthy, prevents crash on write.
+        _install_safe_stdio()
 
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
@@ -3644,10 +3990,11 @@ class AIAgent:
 
         # Honcho prefetch consumption:
         # - First turn: bake into cached system prompt (stable for the session).
-        # - Later turns: inject as ephemeral system context for this API call only.
+        # - Later turns: attach recall to the current-turn user message at
+        #   API-call time only (never persisted to history / session DB).
         #
-        # This keeps the persisted/cached prompt stable while still allowing
-        # turn N to consume background prefetch results from turn N-1.
+        # This keeps the system-prefix cache stable while still allowing turn N
+        # to consume background prefetch results from turn N-1.
         self._honcho_context = ""
         self._honcho_turn_context = ""
         _recall_mode = (self._honcho_config.recall_mode if self._honcho_config else "hybrid")
@@ -3665,6 +4012,7 @@ class AIAgent:
         # Add user message
         user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
         
         if not self.quiet_mode:
             print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
@@ -3814,8 +4162,13 @@ class AIAgent:
             # However, providers like Moonshot AI require a separate 'reasoning_content' field
             # on assistant messages with tool_calls. We handle both cases here.
             api_messages = []
-            for msg in messages:
+            for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
+
+                if idx == current_turn_user_idx and msg.get("role") == "user" and self._honcho_turn_context:
+                    api_msg["content"] = _inject_honcho_turn_context(
+                        api_msg.get("content", ""), self._honcho_turn_context
+                    )
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
@@ -3844,11 +4197,11 @@ class AIAgent:
 
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).
+            # Honcho later-turn recall is intentionally kept OUT of the system prompt
+            # so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            if self._honcho_turn_context:
-                effective_system = (effective_system + "\n\n" + self._honcho_turn_context).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -4266,10 +4619,12 @@ class AIAgent:
                         print(f"{self.log_prefix}   Auth method: {auth_method}")
                         print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if key and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
                         print(f"{self.log_prefix}   Troubleshooting:")
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in ~/.hermes/.env (stale key overrides Claude Code auto-detect)")
+                        print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in ~/.hermes/.env for Hermes-managed OAuth/setup tokens")
+                        print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in ~/.hermes/.env for API keys or legacy token values")
                         print(f"{self.log_prefix}     • For API keys: verify at https://console.anthropic.com/settings/keys")
                         print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
-                        print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
+                        print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_TOKEN \"\"")
+                        print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_API_KEY \"\"")
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time

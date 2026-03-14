@@ -13,7 +13,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from hermes_cli.config import get_env_value, save_env_value
+from hermes_cli.config import get_env_value, get_hermes_home, save_env_value
 from hermes_cli.setup import (
     print_header, print_info, print_success, print_warning, print_error,
     prompt, prompt_choice, prompt_yes_no,
@@ -283,7 +283,7 @@ def systemd_status(deep: bool = False):
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
-    log_dir = Path.home() / ".hermes" / "logs"
+    log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -380,7 +380,7 @@ def launchd_status(deep: bool = False):
         print("✗ Gateway service is not loaded")
     
     if deep:
-        log_file = Path.home() / ".hermes" / "logs" / "gateway.log"
+        log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
             print()
             print("Recent logs:")
@@ -557,7 +557,7 @@ def _platform_status(platform: dict) -> str:
     val = get_env_value(token_var)
     if token_var == "WHATSAPP_ENABLED":
         if val and val.lower() == "true":
-            session_file = Path.home() / ".hermes" / "whatsapp" / "session" / "creds.json"
+            session_file = get_hermes_home() / "whatsapp" / "session" / "creds.json"
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"
@@ -623,6 +623,18 @@ def _setup_standard_platform(platform: dict):
             value = prompt(f"  {var['prompt']}", password=False)
             if value:
                 cleaned = value.replace(" ", "")
+                # For Discord, strip common prefixes (user:123, <@123>, <@!123>)
+                if "DISCORD" in var["name"]:
+                    parts = []
+                    for uid in cleaned.split(","):
+                        uid = uid.strip()
+                        if uid.startswith("<@") and uid.endswith(">"):
+                            uid = uid.lstrip("<@!").rstrip(">")
+                        if uid.lower().startswith("user:"):
+                            uid = uid[5:]
+                        if uid:
+                            parts.append(uid)
+                    cleaned = ",".join(parts)
                 save_env_value(var["name"], cleaned)
                 print_success(f"  Saved — only these users can interact with the bot.")
                 allowed_val_set = cleaned
