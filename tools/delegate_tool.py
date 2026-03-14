@@ -192,6 +192,8 @@ def _run_single_child(
     override_api_mode: Optional[str] = None,
     # Per-task iteration budget (None = share parent's budget)
     override_iteration_budget=None,
+    # Explicit task_id so per-task env overrides match run_conversation's key
+    task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Spawn and run a single child agent. Called from within a thread.
@@ -275,7 +277,7 @@ def _run_single_child(
         # Run with stdout/stderr suppressed to prevent interleaved output
         devnull = io.StringIO()
         with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            result = child.run_conversation(user_message=goal)
+            result = child.run_conversation(user_message=goal, task_id=task_id)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):
@@ -493,12 +495,17 @@ def delegate_task(
             return task_max, IterationBudget(task_max)
         return effective_max_iter, None  # None = share parent's budget
 
-    def _setup_task_backend(task: dict, task_index: int):
-        """Register per-task backend override if specified."""
+    def _setup_task_backend(task: dict, task_index: int) -> str:
+        """Register per-task backend override if specified.
+
+        Returns the deterministic task_id that must be passed to
+        run_conversation() so that terminal_tool looks up overrides
+        under the same key.
+        """
+        task_id = f"delegate_{id(parent_agent)}_{task_index}"
         backend = task.get("terminal_backend")
         if backend:
             from tools.terminal_tool import register_task_env_overrides
-            task_id = f"delegate_{id(parent_agent)}_{task_index}"
             overrides = {"terminal_backend": backend}
             # Forward per-task image, cwd, and SSH connection overrides
             for key in ("docker_image", "modal_image", "singularity_image",
@@ -507,13 +514,14 @@ def delegate_task(
                 if task.get(key):
                     overrides[key] = task[key]
             register_task_env_overrides(task_id, overrides)
+        return task_id
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         t = task_list[0]
         task_creds = _resolve_task_creds(t)
         task_max_iter, task_budget = _resolve_task_budget(t)
-        _setup_task_backend(t, 0)
+        child_task_id = _setup_task_backend(t, 0)
         result = _run_single_child(
             task_index=0,
             goal=t["goal"],
@@ -528,6 +536,7 @@ def delegate_task(
             override_api_key=task_creds["api_key"],
             override_api_mode=task_creds["api_mode"],
             override_iteration_budget=task_budget,
+            task_id=child_task_id,
         )
         results.append(result)
     else:
@@ -545,7 +554,7 @@ def delegate_task(
             for i, t in enumerate(task_list):
                 task_creds = _resolve_task_creds(t)
                 task_max_iter, task_budget = _resolve_task_budget(t)
-                _setup_task_backend(t, i)
+                child_task_id = _setup_task_backend(t, i)
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,
@@ -561,6 +570,7 @@ def delegate_task(
                     override_api_key=task_creds["api_key"],
                     override_api_mode=task_creds["api_mode"],
                     override_iteration_budget=task_budget,
+                    task_id=child_task_id,
                 )
                 futures[future] = i
 
